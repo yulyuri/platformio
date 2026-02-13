@@ -56,7 +56,13 @@ const char* HTML_PAGE = R"rawliteral(
     .status-row {
       display: flex;
       align-items: center;
+      justify-content: space-between;
       margin-bottom: 20px;
+    }
+    
+    .status-left {
+      display: flex;
+      align-items: center;
     }
     
     .status-indicator {
@@ -86,6 +92,15 @@ const char* HTML_PAGE = R"rawliteral(
       font-size: 1.3em;
       font-weight: 600;
       color: #555;
+    }
+    
+    .history-badge {
+      background: linear-gradient(135deg, #84fab0 0%, #8fd3f4 100%);
+      padding: 8px 15px;
+      border-radius: 20px;
+      font-size: 0.85em;
+      font-weight: 600;
+      color: #333;
     }
     
     .controls {
@@ -162,7 +177,6 @@ const char* HTML_PAGE = R"rawliteral(
       gap: 12px;
     }
     
-    /* OPTION A: Purple Shades (Recommended) */
     .btn-power {
       padding: 15px;
       font-size: 15px;
@@ -278,7 +292,6 @@ const char* HTML_PAGE = R"rawliteral(
       font-size: 0.9em;
     }
     
-    /* Modal styles */
     .modal {
       display: none;
       position: fixed;
@@ -427,6 +440,26 @@ const char* HTML_PAGE = R"rawliteral(
       color: #667eea;
       font-weight: bold;
     }
+    
+    .info-box {
+      margin-top: 20px;
+      padding: 15px;
+      background: #f9f9f9;
+      border-radius: 10px;
+    }
+    
+    .info-title {
+      font-size: 0.9em;
+      color: #666;
+      margin-bottom: 10px;
+      font-weight: 600;
+    }
+    
+    .info-content {
+      font-size: 0.85em;
+      color: #999;
+      line-height: 1.6;
+    }
   </style>
 </head>
 <body>
@@ -438,8 +471,11 @@ const char* HTML_PAGE = R"rawliteral(
     
     <div class="card">
       <div class="status-row">
-        <span class="status-indicator" id="statusDot"></span>
-        <span class="status-text" id="statusText">Initializing...</span>
+        <div class="status-left">
+          <span class="status-indicator" id="statusDot"></span>
+          <span class="status-text" id="statusText">Initializing...</span>
+        </div>
+        <div class="history-badge" id="historyBadge">0 reads logged</div>
       </div>
       
       <div class="controls">
@@ -508,7 +544,7 @@ const char* HTML_PAGE = R"rawliteral(
     </div>
     
     <div class="footer">
-      <p>ESP32 RFID Powder Tracking System</p>
+      <p>ESP32 RFID Powder Tracking System &bull; Logging up to 1000 reads</p>
     </div>
   </div>
   
@@ -567,17 +603,13 @@ const char* HTML_PAGE = R"rawliteral(
           Examples: "Level-1-Front", "Level-2-Back", "Level-3-Center"
         </p>
         <input type="text" id="testLocation" placeholder="e.g., Level-1-Front-Shelf" maxlength="50">
-        <div style="margin-top: 20px; padding: 15px; background: #f9f9f9; border-radius: 10px;">
-          <div style="font-size: 0.9em; color: #666; margin-bottom: 10px;">
-            <strong>Export will include:</strong>
-          </div>
-          <div style="font-size: 0.85em; color: #999; line-height: 1.6;">
-            • Timestamp<br>
-            • Test location/name<br>
-            • All detected tags<br>
-            • RSSI values<br>
-            • Read counts<br>
-            • Bottle names
+        <div class="info-box">
+          <div class="info-title">Export will include:</div>
+          <div class="info-content">
+            • Every single tag read with timestamp<br>
+            • RSSI value for each read<br>
+            • Perfect for analyzing signal fluctuation<br>
+            • Current logged reads: <strong id="exportReadCount">0</strong>
           </div>
         </div>
       </div>
@@ -596,21 +628,21 @@ const char* HTML_PAGE = R"rawliteral(
       fetch('/api/status')
         .then(response => response.json())
         .then(data => {
-          // Store current tag data for export
           currentTagData = data.tags || [];
           
-          // Update status indicator
           const statusText = data.scanning ? 'Scanning Active' : 'Idle';
           document.getElementById('statusText').textContent = statusText;
           
           const statusDot = document.getElementById('statusDot');
           statusDot.className = 'status-indicator ' + (data.scanning ? 'active' : 'inactive');
           
-          // Update stats
+          // Update history badge
+          const historyCount = data.historyCount || 0;
+          document.getElementById('historyBadge').textContent = historyCount + ' reads logged';
+          
           document.getElementById('tagCount').textContent = data.tagCount;
           document.getElementById('powerDisplay').textContent = (data.power / 100).toFixed(1);
           
-          // Handle registration mode
           if (data.registrationMode) {
             const progress = Math.min(data.registrationProgress, 5);
             const percent = (progress / 5) * 100;
@@ -632,7 +664,6 @@ const char* HTML_PAGE = R"rawliteral(
             }
           }
           
-          // Update tag table
           const tableBody = document.getElementById('tagTableBody');
           if (data.tags && data.tags.length > 0) {
             let html = '';
@@ -681,7 +712,7 @@ const char* HTML_PAGE = R"rawliteral(
     }
     
     function clearTags() {
-      if (confirm('Clear all detected tags from this session?\n\n(Registered names will be kept)')) {
+      if (confirm('Clear all detected tags and reading history?\n\n(Registered names will be kept)')) {
         fetch('/api/clear')
           .then(() => updateStatus())
           .catch(err => console.error('Error clearing tags:', err));
@@ -734,14 +765,23 @@ const char* HTML_PAGE = R"rawliteral(
     }
     
     function showExportDialog() {
-      if (!currentTagData || currentTagData.length === 0) {
-        alert('No tags detected to export!\n\nStart scanning and detect some tags first.');
-        return;
-      }
-      
-      document.getElementById('testLocation').value = '';
-      document.getElementById('exportModal').style.display = 'block';
-      document.getElementById('testLocation').focus();
+      fetch('/api/history')
+        .then(response => response.json())
+        .then(data => {
+          if (!data.readings || data.readings.length === 0) {
+            alert('No reading history to export!\n\nStart scanning and detect some tags first.');
+            return;
+          }
+          
+          document.getElementById('testLocation').value = '';
+          document.getElementById('exportReadCount').textContent = data.count;
+          document.getElementById('exportModal').style.display = 'block';
+          document.getElementById('testLocation').focus();
+        })
+        .catch(err => {
+          console.error('Error checking history:', err);
+          alert('Error loading history data!');
+        });
     }
     
     function cancelExport() {
@@ -757,41 +797,48 @@ const char* HTML_PAGE = R"rawliteral(
         return;
       }
       
-      // Generate CSV
-      const now = new Date();
-      const timestamp = now.toISOString().replace('T', ' ').substring(0, 19);
-      const dateStr = now.toISOString().substring(0, 10);
-      const timeStr = now.toTimeString().substring(0, 8).replace(/:/g, '-');
-      
-      let csv = 'Timestamp,Test Location,No.,Bottle Name,EPC,PC,RSSI (dBm),Read Count,Antenna\n';
-      
-      currentTagData.forEach(tag => {
-        const name = tag.name || 'Unregistered';
-        csv += `"${timestamp}","${location}",${tag.no},"${name}","${tag.epc}","${tag.pc}",${tag.rssi},${tag.cnt},${tag.ant}\n`;
-      });
-      
-      // Download CSV
-      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-      const link = document.createElement('a');
-      const url = URL.createObjectURL(blob);
-      
-      const filename = `RFID_${location.replace(/\s+/g, '_')}_${dateStr}_${timeStr}.csv`;
-      
-      link.setAttribute('href', url);
-      link.setAttribute('download', filename);
-      link.style.visibility = 'hidden';
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      
-      document.getElementById('exportModal').style.display = 'none';
-      alert('CSV exported successfully!\n\nFile: ' + filename);
+      fetch('/api/history')
+        .then(response => response.json())
+        .then(data => {
+          if (!data.readings || data.readings.length === 0) {
+            alert('No reading history to export!');
+            return;
+          }
+          
+          const now = new Date();
+          const dateStr = now.toISOString().substring(0, 10);
+          const timeStr = now.toTimeString().substring(0, 8).replace(/:/g, '-');
+          
+          let csv = 'Test Location,Read Number,Timestamp,Bottle Name,EPC,RSSI (dBm)\n';
+          
+          data.readings.forEach((reading, index) => {
+            const name = reading.name || 'Unregistered';
+            csv += `"${location}",${index + 1},"${reading.time}","${name}","${reading.epc}",${reading.rssi}\n`;
+          });
+          
+          const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+          const link = document.createElement('a');
+          const url = URL.createObjectURL(blob);
+          
+          const filename = `RFID_${location.replace(/\s+/g, '_')}_${dateStr}_${timeStr}.csv`;
+          
+          link.setAttribute('href', url);
+          link.setAttribute('download', filename);
+          link.style.visibility = 'hidden';
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+          
+          document.getElementById('exportModal').style.display = 'none';
+          alert(`CSV exported successfully!\n\nFile: ${filename}\nTotal reads: ${data.readings.length}`);
+        })
+        .catch(err => {
+          console.error('Error exporting:', err);
+          alert('Error exporting data!');
+        });
     }
     
-    // Auto-update every 1 second
     setInterval(updateStatus, 1000);
-    
-    // Initial update
     updateStatus();
   </script>
 </body>

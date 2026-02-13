@@ -30,7 +30,7 @@ int bufferIndex = 0;
 bool registrationMode = false;
 String registrationEPC = "";
 int registrationConfirmCount = 0;
-#define REGISTRATION_CONFIRM_THRESHOLD 5  // Need 5 consistent reads
+#define REGISTRATION_CONFIRM_THRESHOLD 5
 
 // Structure to store complete tag information
 struct TagInfo {
@@ -41,22 +41,50 @@ struct TagInfo {
   int readCount;
   int antenna;
   unsigned long lastSeen;
-  String friendlyName;  // User-assigned name
+  String friendlyName;
 };
 
 #define MAX_UNIQUE_TAGS 50
 TagInfo tagDatabase[MAX_UNIQUE_TAGS];
 int tagDatabaseCount = 0;
 
+// Reading history for CSV export - captures EVERY read
+struct ReadingHistory {
+  unsigned long timestamp;
+  String epc;
+  String bottleName;
+  int rssi;
+  String datetime;
+};
+
+#define MAX_HISTORY 1000
+ReadingHistory readingHistory[MAX_HISTORY];
+int historyCount = 0;
+unsigned long systemStartTime = 0;
+
+// Helper function to generate timestamp
+String getTimestamp() {
+  unsigned long elapsed = millis() - systemStartTime;
+  unsigned long seconds = elapsed / 1000;
+  unsigned long minutes = seconds / 60;
+  unsigned long hours = minutes / 60;
+  
+  seconds = seconds % 60;
+  minutes = minutes % 60;
+  
+  char timestamp[20];
+  sprintf(timestamp, "%02lu:%02lu:%02lu", hours, minutes, seconds);
+  return String(timestamp);
+}
+
 // ========================================
 // Tag Name Management
 // ========================================
 
 void saveTagName(String epc, String name) {
-  preferences.begin("rfid", false);  // Read-write
+  preferences.begin("rfid", false);
   
-  // Use a simple key based on EPC
-  String key = "name_" + epc.substring(0, 8);  // Use first 8 chars as key
+  String key = "name_" + epc.substring(0, 8);
   preferences.putString(key.c_str(), epc + "|" + name);
   
   preferences.end();
@@ -65,14 +93,13 @@ void saveTagName(String epc, String name) {
 }
 
 String getTagName(String epc) {
-  preferences.begin("rfid", true);  // Read-only
+  preferences.begin("rfid", true);
   
   String key = "name_" + epc.substring(0, 8);
   String stored = preferences.getString(key.c_str(), "");
   
   preferences.end();
   
-  // Parse stored format: "EPC|NAME"
   if (stored.length() > 0 && stored.startsWith(epc)) {
     int separator = stored.indexOf('|');
     if (separator > 0) {
@@ -100,6 +127,7 @@ void handleStatus() {
   json += "\"registrationMode\":" + String(registrationMode ? "true" : "false") + ",";
   json += "\"registrationEPC\":\"" + registrationEPC + "\",";
   json += "\"registrationProgress\":" + String(registrationConfirmCount) + ",";
+  json += "\"historyCount\":" + String(historyCount) + ",";
   
   // Add full tag table data
   json += "\"tags\":[";
@@ -119,6 +147,24 @@ void handleStatus() {
   json += "]";
   json += "}";
   
+  server.send(200, "application/json", json);
+}
+
+void handleHistory() {
+  // Return reading history as JSON
+  String json = "{\"count\":" + String(historyCount) + ",\"readings\":[";
+  
+  for (int i = 0; i < historyCount; i++) {
+    if (i > 0) json += ",";
+    json += "{";
+    json += "\"time\":\"" + readingHistory[i].datetime + "\",";
+    json += "\"epc\":\"" + readingHistory[i].epc + "\",";
+    json += "\"name\":\"" + readingHistory[i].bottleName + "\",";
+    json += "\"rssi\":" + String(readingHistory[i].rssi);
+    json += "}";
+  }
+  
+  json += "]}";
   server.send(200, "application/json", json);
 }
 
@@ -146,21 +192,21 @@ void handlePower() {
 }
 
 void handleClear() {
-  // Clear tag database (session only, names are kept)
+  // Clear tag database AND history
   tagDatabaseCount = 0;
   tagCount = 0;
+  historyCount = 0;
+  systemStartTime = millis();
   lastTagEPC = "No tags detected yet";
-  Serial.println("Tag database cleared!");
+  Serial.println("Tag database and history cleared!");
   server.send(200, "text/plain", "OK");
 }
 
 void handleRegisterStart() {
-  // Start registration mode
   registrationMode = true;
   registrationEPC = "";
   registrationConfirmCount = 0;
   
-  // Start scanning if not already
   if (!isScanning) {
     startMultiplePolling();
     isScanning = true;
@@ -187,10 +233,8 @@ void handleRegisterConfirm() {
   String name = server.arg("name");
   String epc = server.arg("epc");
   
-  // Save to flash
   saveTagName(epc, name);
   
-  // Update database if tag is currently visible
   for (int i = 0; i < tagDatabaseCount; i++) {
     if (tagDatabase[i].epc == epc) {
       tagDatabase[i].friendlyName = name;
@@ -199,7 +243,6 @@ void handleRegisterConfirm() {
     }
   }
   
-  // Exit registration mode
   registrationMode = false;
   registrationEPC = "";
   registrationConfirmCount = 0;
@@ -250,6 +293,7 @@ void setupWebServer() {
   
   server.on("/", handleRoot);
   server.on("/api/status", handleStatus);
+  server.on("/api/history", handleHistory);
   server.on("/api/start", handleStart);
   server.on("/api/stop", handleStop);
   server.on("/api/power", handlePower);
@@ -270,28 +314,23 @@ void setupWebServer() {
 void setupR200() {
   Serial.println("\n--- R200 RFID Reader Setup ---");
   
-  // Initialize Serial2 for R200 communication
   Serial2.begin(R200_BAUD, SERIAL_8N1, R200_RX_PIN, R200_TX_PIN);
   
-  // Clear any pending data
   delay(500);
   while (Serial2.available()) {
     Serial2.read();
   }
   
-  // Get module information
   Serial.println("Querying module info...");
   getHardwareVersion();
   delay(300);
   getSoftwareVersion();
   delay(300);
   
-  // Set initial power
   Serial.println("Setting initial power...");
   setPower(currentPower);
   delay(300);
   
-  // Verify power setting
   getPower();
   delay(300);
   
@@ -303,8 +342,8 @@ void setupR200() {
 // ========================================
 
 void setup() {
-  // Initialize serial monitor
   Serial.begin(115200);
+  systemStartTime = millis();
   delay(2000);
   
   Serial.println("\n\n");
@@ -312,15 +351,12 @@ void setup() {
   Serial.println("   ESP32 RFID POWDER TRACKING");
   Serial.println("====================================");
   
-  // Setup WiFi
   setupWiFi();
   
-  // Setup web server
   if (WiFi.status() == WL_CONNECTED) {
     setupWebServer();
   }
   
-  // Setup R200 RFID reader
   setupR200();
   
   Serial.println("\n====================================");
@@ -335,31 +371,25 @@ void setup() {
 // ========================================
 
 void loop() {
-  // Handle web server requests
   server.handleClient();
   
-  // Process R200 data
   while (Serial2.available()) {
     byte b = Serial2.read();
     byteCount++;
     
-    // Print raw data for debugging (only when not in registration mode to reduce spam)
     if (!registrationMode) {
       if (b < 0x10) Serial.print("0");
       Serial.print(b, HEX);
       Serial.print(" ");
     }
     
-    // Add to buffer safely
     if (bufferIndex < BUFFER_SIZE) {
       rxBuffer[bufferIndex++] = b;
     } else {
-      // Buffer overflow - reset
       Serial.println("\n[Buffer overflow - resetting]");
       bufferIndex = 0;
     }
     
-    // Check for complete packet (0xAA ... 0xDD)
     if (b == 0xDD && bufferIndex > 2 && rxBuffer[0] == 0xAA) {
       if (!registrationMode) {
         Serial.print("\n<-- Packet (len=");
@@ -367,14 +397,11 @@ void loop() {
         Serial.println(")");
       }
       
-      // Check if TAG packet: Byte[1]=0x02, Byte[2]=0x22
       if (bufferIndex >= 24 && rxBuffer[1] == 0x02 && rxBuffer[2] == 0x22) {
         
-        // Extract RSSI
         byte rssi_raw = rxBuffer[5];
         int rssi_dbm = (int)rssi_raw - 256;
         
-        // Extract PC (Protocol Control) - 2 bytes
         String pc = "";
         if (rxBuffer[6] < 0x10) pc += "0";
         pc += String(rxBuffer[6], HEX);
@@ -382,7 +409,6 @@ void loop() {
         pc += String(rxBuffer[7], HEX);
         pc.toUpperCase();
         
-        // Extract EPC (12 bytes, positions 8-19)
         String epc = "";
         for (int i = 8; i < 20; i++) {
           if (rxBuffer[i] < 0x10) epc += "0";
@@ -390,7 +416,6 @@ void loop() {
         }
         epc.toUpperCase();
         
-        // Extract CRC (2 bytes)
         String crc = "";
         if (rxBuffer[20] < 0x10) crc += "0";
         crc += String(rxBuffer[20], HEX);
@@ -401,13 +426,11 @@ void loop() {
         // REGISTRATION MODE HANDLING
         if (registrationMode) {
           if (registrationEPC == "") {
-            // First detection
             registrationEPC = epc;
             registrationConfirmCount = 1;
             Serial.println("\n>>> Tag detected: " + epc);
             Serial.println(">>> Hold steady... (1/5)");
           } else if (registrationEPC == epc) {
-            // Same tag detected again
             registrationConfirmCount++;
             Serial.println(">>> Confirmation: " + String(registrationConfirmCount) + "/5");
             
@@ -415,14 +438,12 @@ void loop() {
               Serial.println(">>> TAG READY FOR NAMING <<<");
             }
           } else {
-            // Different tag detected - reset
             registrationEPC = epc;
             registrationConfirmCount = 1;
             Serial.println("\n>>> Different tag detected: " + epc);
             Serial.println(">>> Restarting... (1/5)");
           }
         } else {
-          // Normal mode - show tag detection
           Serial.println("=== TAG DETECTED ===");
           Serial.print("EPC: ");
           Serial.println(epc);
@@ -431,7 +452,7 @@ void loop() {
           Serial.println(" dBm");
         }
         
-        // NORMAL MODE HANDLING (always update database)
+        // NORMAL MODE - Update database
         int tagIndex = -1;
         for (int i = 0; i < tagDatabaseCount; i++) {
           if (tagDatabase[i].epc == epc) {
@@ -450,7 +471,7 @@ void loop() {
             tagDatabase[tagDatabaseCount].readCount = 1;
             tagDatabase[tagDatabaseCount].antenna = 1;
             tagDatabase[tagDatabaseCount].lastSeen = millis();
-            tagDatabase[tagDatabaseCount].friendlyName = getTagName(epc);  // Load saved name
+            tagDatabase[tagDatabaseCount].friendlyName = getTagName(epc);
             tagDatabaseCount++;
             
             if (!registrationMode) {
@@ -471,6 +492,20 @@ void loop() {
           }
         }
         
+        // LOG EVERY SINGLE READ TO HISTORY
+        if (historyCount < MAX_HISTORY) {
+          readingHistory[historyCount].timestamp = millis();
+          readingHistory[historyCount].epc = epc;
+          readingHistory[historyCount].bottleName = (tagIndex >= 0) ? tagDatabase[tagIndex].friendlyName : "";
+          readingHistory[historyCount].rssi = rssi_dbm;
+          readingHistory[historyCount].datetime = getTimestamp();
+          historyCount++;
+        } else {
+          if (!registrationMode) {
+            Serial.println("[Warning: History buffer full - 5000 reads captured]");
+          }
+        }
+        
         tagCount = tagDatabaseCount;
         lastTagEPC = epc;
         lastTagTime = millis();
@@ -483,13 +518,11 @@ void loop() {
       bufferIndex = 0;
     }
     
-    // Newline every 20 bytes for readability (only when not registering)
     if (!registrationMode && byteCount % 20 == 0) {
       Serial.println();
     }
   }
   
-  // WiFi keepalive check
   static unsigned long lastWiFiCheck = 0;
   if (millis() - lastWiFiCheck > 10000) {
     if (WiFi.status() != WL_CONNECTED) {
