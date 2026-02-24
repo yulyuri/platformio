@@ -3,13 +3,13 @@
 
 #include <Arduino.h>
 
-// Calc checksum for R200 protocol
-byte calculateChecksum(byte* data, int startPos, int endPos) {
-  byte sum = 0;
-  for (int i = startPos; i <= endPos; i++) {
-    sum += data[i];
+// Calculate checksum for R200 commands - USE ADDITION NOT XOR!
+byte calculateChecksum(byte* data, int len) {
+  byte checksum = 0;
+  for (int i = 1; i < len; i++) {  // Start from 1 (skip 0xAA)
+    checksum += data[i];  // ADDITION!
   }
-  return sum;
+  return checksum;
 }
 
 // command to R200 via Serial2
@@ -30,19 +30,21 @@ void sendR200Command(byte* cmd, int len) {
 //{0xAA, 0x00, 0xB6, 0x00, 0x02, 0x07, 0xD0, 0x8F, 0xDD,}, //23. Set the transmitting power 
 
 
-
-// Set RF transmit power
-// powerValue format: dBm * 100 (e.g., 3000 = 30.00 dBm)
-void setPower(int powerValue) {
-  byte highByte = (powerValue >> 8) & 0xFF;
-  byte lowByte = powerValue & 0xFF;
+void setPower(int power) {
+  byte cmd[9];
+  cmd[0] = 0xAA;
+  cmd[1] = 0x00;
+  cmd[2] = 0xB6;
+  cmd[3] = 0x00;
+  cmd[4] = 0x02;
+  cmd[5] = (power >> 8) & 0xFF;
+  cmd[6] = power & 0xFF;
+  cmd[7] = calculateChecksum(cmd, 7);  // Sum of bytes 1-6
+  cmd[8] = 0xDD;
   
-  byte cmd[] = {0xAA, 0x00, 0xB6, 0x00, 0x02, highByte, lowByte, 0x00, 0xDD};
-  cmd[7] = calculateChecksum(cmd, 1, 6);
-  sendR200Command(cmd, sizeof(cmd));
-  
+  Serial2.write(cmd, sizeof(cmd));
   Serial.print("Power set to ");
-  Serial.print(powerValue / 100.0);
+  Serial.print(power / 100.0);
   Serial.println(" dBm");
 }
 
@@ -91,7 +93,11 @@ void getSoftwareVersion() {
   byte cmd[] = {0xAA, 0x00, 0x03, 0x00, 0x01, 0x01, 0x05, 0xDD};
   sendR200Command(cmd, sizeof(cmd));
   Serial.println("Requesting software version...");
-}// Write EPC to tag
+}
+
+
+
+// Write EPC to tag
 bool writeEPC(String epcHex) {
   if (epcHex.length() != 24) {
     Serial.println("Error: EPC must be exactly 24 hex characters (12 bytes)");
@@ -120,10 +126,10 @@ bool writeEPC(String epcHex) {
   // Memory bank: 0x01 = EPC
   cmd[9] = 0x01;
   
-  // Starting address: BYTE 4 (not word 2) - TRY THIS
+  // Starting address: Word 2
   cmd[10] = 0x00;
   cmd[11] = 0x00;
-  cmd[12] = 0x20;  // Changed from 0x02 to 0x04
+  cmd[12] = 0x02;
   
   // Word count: 6 words
   cmd[13] = 0x06;
@@ -133,10 +139,10 @@ bool writeEPC(String epcHex) {
     cmd[14 + i] = epcBytes[i];
   }
   
-  // Checksum
+  // Calculate checksum - FIXED! Use ADDITION not XOR
   byte checksum = 0;
   for (int i = 1; i < 26; i++) {
-    checksum ^= cmd[i];
+    checksum += cmd[i];  // ADDITION!
   }
   cmd[26] = checksum;
   
@@ -152,7 +158,7 @@ bool writeEPC(String epcHex) {
   Serial.println();
   
   Serial2.write(cmd, 28);
-  Serial.println("Writing EPC (address as BYTE 4): " + epcHex);
+  Serial.println("Writing EPC with SUM checksum: " + epcHex);
   
   return true;
 }

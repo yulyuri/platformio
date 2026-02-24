@@ -637,6 +637,16 @@ void loop() {
             }
           }
         }
+        // END OF PROGRAMMING MODE HANDLING
+        
+        // *** SLOW DOWN SCANNING - 2 reads per second ***
+        static unsigned long lastTagRead = 0;
+        if (millis() - lastTagRead < 500) {  // 500ms = 2 reads/second
+          bufferIndex = 0;
+          continue;  // Skip this read
+        }
+        lastTagRead = millis();
+        // *** END SLOW DOWN ***
         
         // NORMAL MODE - Update database
         if (!registrationMode && !programmingMode) {
