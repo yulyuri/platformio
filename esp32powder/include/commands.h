@@ -91,6 +91,69 @@ void getSoftwareVersion() {
   byte cmd[] = {0xAA, 0x00, 0x03, 0x00, 0x01, 0x01, 0x05, 0xDD};
   sendR200Command(cmd, sizeof(cmd));
   Serial.println("Requesting software version...");
+}// Write EPC to tag
+bool writeEPC(String epcHex) {
+  if (epcHex.length() != 24) {
+    Serial.println("Error: EPC must be exactly 24 hex characters (12 bytes)");
+    return false;
+  }
+  
+  byte epcBytes[12];
+  for (int i = 0; i < 12; i++) {
+    String byteStr = epcHex.substring(i * 2, i * 2 + 2);
+    epcBytes[i] = strtol(byteStr.c_str(), NULL, 16);
+  }
+  
+  byte cmd[28];
+  cmd[0] = 0xAA;
+  cmd[1] = 0x00;
+  cmd[2] = 0x49;
+  cmd[3] = 0x00;
+  cmd[4] = 0x15;  // Length = 21 bytes
+  
+  // Access password
+  cmd[5] = 0x00;
+  cmd[6] = 0x00;
+  cmd[7] = 0x00;
+  cmd[8] = 0x00;
+  
+  // Memory bank: 0x01 = EPC
+  cmd[9] = 0x01;
+  
+  // Starting address: BYTE 4 (not word 2) - TRY THIS
+  cmd[10] = 0x00;
+  cmd[11] = 0x00;
+  cmd[12] = 0x20;  // Changed from 0x02 to 0x04
+  
+  // Word count: 6 words
+  cmd[13] = 0x06;
+  
+  // EPC data
+  for (int i = 0; i < 12; i++) {
+    cmd[14 + i] = epcBytes[i];
+  }
+  
+  // Checksum
+  byte checksum = 0;
+  for (int i = 1; i < 26; i++) {
+    checksum ^= cmd[i];
+  }
+  cmd[26] = checksum;
+  
+  cmd[27] = 0xDD;
+  
+  // Send
+  Serial.print("TX: ");
+  for (int i = 0; i < 28; i++) {
+    if (cmd[i] < 0x10) Serial.print("0");
+    Serial.print(cmd[i], HEX);
+    Serial.print(" ");
+  }
+  Serial.println();
+  
+  Serial2.write(cmd, 28);
+  Serial.println("Writing EPC (address as BYTE 4): " + epcHex);
+  
+  return true;
 }
-
 #endif
