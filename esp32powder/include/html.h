@@ -53,6 +53,15 @@ const char* HTML_PAGE = R"rawliteral(
       50% { opacity: 0.7; transform: scale(1.1); }
     }
     .status-text { font-size: 1.3em; font-weight: 600; color: #555; }
+    .mode-badge {
+      background: linear-gradient(135deg, #ffeaa7 0%, #fdcb6e 100%);
+      padding: 8px 15px;
+      border-radius: 20px;
+      font-size: 0.85em;
+      font-weight: 600;
+      color: #2d3436;
+      margin-left: 15px;
+    }
     .history-badge {
       background: linear-gradient(135deg, #84fab0 0%, #8fd3f4 100%);
       padding: 8px 15px;
@@ -87,6 +96,20 @@ const char* HTML_PAGE = R"rawliteral(
     .btn-export { background: linear-gradient(135deg, #84fab0 0%, #8fd3f4 100%); color: #333; }
     .section { margin: 30px 0; padding-top: 20px; border-top: 2px solid #f0f0f0; }
     .section h3 { margin-bottom: 15px; color: #555; font-size: 1.1em; }
+    .mode-buttons { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 20px; }
+    .btn-mode {
+      padding: 15px;
+      font-size: 14px;
+      border: 2px solid #667eea;
+      border-radius: 12px;
+      cursor: pointer;
+      font-weight: 600;
+      transition: all 0.3s;
+      background: white;
+      color: #667eea;
+    }
+    .btn-mode:hover { background: #f5f7ff; transform: translateY(-2px); }
+    .btn-mode.active { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border-color: #667eea; }
     .power-buttons { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
     .btn-power {
       padding: 15px;
@@ -243,6 +266,7 @@ const char* HTML_PAGE = R"rawliteral(
         <div class="status-left">
           <span class="status-indicator" id="statusDot"></span>
           <span class="status-text" id="statusText">Initializing...</span>
+          <span class="mode-badge" id="modeBadge">Controlled</span>
         </div>
         <div class="history-badge" id="historyBadge">0 reads logged</div>
       </div>
@@ -255,6 +279,8 @@ const char* HTML_PAGE = R"rawliteral(
         <button class="btn btn-program" onclick="showProgramDialog()">Program Tag</button>
         <button class="btn btn-export" onclick="showExportDialog()">Export CSV</button>
       </div>
+      
+      
       
       <div class="section">
         <h3>Power Level Control</h3>
@@ -298,7 +324,7 @@ const char* HTML_PAGE = R"rawliteral(
     </div>
     
     <div class="footer">
-      <p>ESP32 RFID Powder Tracking System &bull; http://192.168.156.100</p>
+      <p>ESP32 RFID Powder Tracking System &bull; http://192.168.34.134</p>
     </div>
   </div>
   
@@ -409,6 +435,18 @@ const char* HTML_PAGE = R"rawliteral(
     let currentTagData = [];
     let targetProgramEPC = '';
     let programMode = 'auto';
+    let currentMode = 'controlled';
+    
+    function setMode(mode) {
+      fetch('/api/mode?mode=' + mode).then(() => {
+        currentMode = mode;
+        document.getElementById('modeSingle').classList.remove('active');
+        document.getElementById('modeMultiple').classList.remove('active');
+        document.getElementById('modeControlled').classList.remove('active');
+        document.getElementById('mode' + mode.charAt(0).toUpperCase() + mode.slice(1)).classList.add('active');
+        updateStatus();
+      });
+    }
     
     function updateStatus() {
       fetch('/api/status')
@@ -417,6 +455,7 @@ const char* HTML_PAGE = R"rawliteral(
           currentTagData = data.tags || [];
           document.getElementById('statusText').textContent = data.scanning ? 'Scanning Active' : 'Idle';
           document.getElementById('statusDot').className = 'status-indicator ' + (data.scanning ? 'active' : 'inactive');
+          document.getElementById('modeBadge').textContent = data.mode || 'Controlled';
           document.getElementById('historyBadge').textContent = (data.historyCount || 0) + ' reads logged';
           document.getElementById('tagCount').textContent = data.tagCount;
           document.getElementById('powerDisplay').textContent = (data.power / 100).toFixed(1);

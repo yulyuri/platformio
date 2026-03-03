@@ -2,27 +2,23 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include <ESPmDNS.h>
 
-// Include our header files
 #include "config.h"
 #include "commands.h"
 #include "html.h"
 
-// Create web server instance
 WebServer server(WEB_SERVER_PORT);
-
-// Preferences for persistent storage
 Preferences preferences;
 
-// Global state variables
+// Global state
 bool isScanning = false;
 int currentPower = DEFAULT_POWER;
 String lastTagEPC = "No tags detected yet";
 int tagCount = 0;
-int byteCount = 0;
 unsigned long lastTagTime = 0;
 
-// Buffer for R200 data
+// Buffer
 byte rxBuffer[BUFFER_SIZE];
 int bufferIndex = 0;
 
@@ -39,7 +35,7 @@ int programmingConfirmCount = 0;
 bool programmingWriteComplete = false;
 int verifyAttempts = 0;
 
-// Structure to store complete tag information
+// Tag database
 struct TagInfo {
   String epc;
   String pc;
@@ -55,7 +51,7 @@ struct TagInfo {
 TagInfo tagDatabase[MAX_UNIQUE_TAGS];
 int tagDatabaseCount = 0;
 
-// Reading history for CSV export - captures EVERY read
+// Reading history
 struct ReadingHistory {
   unsigned long timestamp;
   String epc;
@@ -69,13 +65,12 @@ ReadingHistory readingHistory[MAX_HISTORY];
 int historyCount = 0;
 unsigned long systemStartTime = 0;
 
-// Helper function to generate timestamp
+// Timestamp helper
 String getTimestamp() {
   unsigned long elapsed = millis() - systemStartTime;
   unsigned long seconds = elapsed / 1000;
   unsigned long minutes = seconds / 60;
   unsigned long hours = minutes / 60;
-  
   seconds = seconds % 60;
   minutes = minutes % 60;
   
@@ -84,27 +79,19 @@ String getTimestamp() {
   return String(timestamp);
 }
 
-// ========================================
-// Tag Name Management
-// ========================================
-
+// Tag name management
 void saveTagName(String epc, String name) {
   preferences.begin("rfid", false);
-  
   String key = "name_" + epc.substring(0, 8);
   preferences.putString(key.c_str(), epc + "|" + name);
-  
   preferences.end();
-  
   Serial.println("Saved: " + epc + " -> " + name);
 }
 
 String getTagName(String epc) {
   preferences.begin("rfid", true);
-  
   String key = "name_" + epc.substring(0, 8);
   String stored = preferences.getString(key.c_str(), "");
-  
   preferences.end();
   
   if (stored.length() > 0 && stored.startsWith(epc)) {
@@ -113,14 +100,150 @@ String getTagName(String epc) {
       return stored.substring(separator + 1);
     }
   }
-  
   return "";
 }
 
-// ========================================
-// Web Server Route Handlers
-// ========================================
+// Process tag packet
+void processTagPacket() {
+  byte rssi_raw = rxBuffer[5];
+  int rssi_dbm = (int)rssi_raw - 256;
+  
+  String pc = "";
+  if (rxBuffer[6] < 0x10) pc += "0";
+  pc += String(rxBuffer[6], HEX);
+  if (rxBuffer[7] < 0x10) pc += "0";
+  pc += String(rxBuffer[7], HEX);
+  pc.toUpperCase();
+  
+  String epc = "";
+  for (int i = 8; i < 20; i++) {
+    if (rxBuffer[i] < 0x10) epc += "0";
+    epc += String(rxBuffer[i], HEX);
+  }
+  epc.toUpperCase();
+  
+  // CRC (might not exist in 20-byte packets)
+  String crc = "";
+  if (bufferIndex >= 24) {
+    if (rxBuffer[20] < 0x10) crc += "0";
+    crc += String(rxBuffer[20], HEX);
+    if (rxBuffer[21] < 0x10) crc += "0";
+    crc += String(rxBuffer[21], HEX);
+    crc.toUpperCase();
+  } else {
+    crc = "N/A";
+  }
+  
+  // Registration mode
+  if (registrationMode) {
+    if (registrationEPC == "") {
+      registrationEPC = epc;
+      registrationConfirmCount = 1;
+    } else if (registrationEPC == epc) {
+      registrationConfirmCount++;
+      if (registrationConfirmCount >= REGISTRATION_CONFIRM_THRESHOLD) {
+        Serial.println(">>> READY FOR NAMING <<<");
+      }
+    } else {
+      registrationEPC = epc;
+      registrationConfirmCount = 1;
+    }
+    return;
+  }
+  
+  // Programming mode
+  if (programmingMode) {
+    bool isBlank = true;
+    for (int i = 8; i < 20; i++) {
+      if (rxBuffer[i] != 0x00) {
+        isBlank = false;
+        break;
+      }
+    }
+    
+    if (isBlank && !programmingWriteComplete) {
+      programmingConfirmCount++;
+      if (programmingConfirmCount >= 3) {
+        Serial.println(">>> WRITING <<<");
+        stopMultiplePolling();
+        delay(500);
+        
+        while (Serial2.available()) Serial2.read();
+        bufferIndex = 0;
+        
+        writeEPC(programmingEPC);
+        delay(1000);
+        
+        while (Serial2.available()) Serial2.read();
+        bufferIndex = 0;
+        
+        programmingWriteComplete = true;
+        programmingConfirmCount = 0;
+        startMultiplePolling();
+        delay(300);
+      }
+    } else if (!isBlank && programmingWriteComplete) {
+      if (epc == programmingEPC) {
+        Serial.println(">>> SUCCESS! <<<");
+        programmingMode = false;
+        programmingWriteComplete = false;
+        programmingConfirmCount = 0;
+        verifyAttempts = 0;
+      } else {
+        verifyAttempts++;
+        if (verifyAttempts > 8) {
+          Serial.println(">>> FAILED <<<");
+          programmingMode = false;
+          programmingWriteComplete = false;
+          verifyAttempts = 0;
+        }
+      }
+    }
+    return;
+  }
+  
+  // Normal mode - update database
+  int tagIndex = -1;
+  for (int i = 0; i < tagDatabaseCount; i++) {
+    if (tagDatabase[i].epc == epc) {
+      tagIndex = i;
+      break;
+    }
+  }
+  
+  if (tagIndex == -1) {
+    if (tagDatabaseCount < MAX_UNIQUE_TAGS) {
+      tagDatabase[tagDatabaseCount].epc = epc;
+      tagDatabase[tagDatabaseCount].pc = pc;
+      tagDatabase[tagDatabaseCount].crc = crc;
+      tagDatabase[tagDatabaseCount].rssi = rssi_dbm;
+      tagDatabase[tagDatabaseCount].readCount = 1;
+      tagDatabase[tagDatabaseCount].antenna = 1;
+      tagDatabase[tagDatabaseCount].lastSeen = millis();
+      tagDatabase[tagDatabaseCount].friendlyName = getTagName(epc);
+      tagDatabaseCount++;
+    }
+  } else {
+    tagDatabase[tagIndex].rssi = rssi_dbm;
+    tagDatabase[tagIndex].readCount++;
+    tagDatabase[tagIndex].lastSeen = millis();
+  }
+  
+  if (historyCount < MAX_HISTORY) {
+    readingHistory[historyCount].timestamp = millis();
+    readingHistory[historyCount].epc = epc;
+    readingHistory[historyCount].bottleName = (tagIndex >= 0) ? tagDatabase[tagIndex].friendlyName : "";
+    readingHistory[historyCount].rssi = rssi_dbm;
+    readingHistory[historyCount].datetime = getTimestamp();
+    historyCount++;
+  }
+  
+  tagCount = tagDatabaseCount;
+  lastTagEPC = epc;
+  lastTagTime = millis();
+}
 
+// Web handlers
 void handleRoot() {
   server.send(200, "text/html", HTML_PAGE);
 }
@@ -140,7 +263,6 @@ void handleStatus() {
   json += "\"programmingProgress\":" + String(programmingConfirmCount) + ",";
   json += "\"programmingComplete\":" + String(programmingWriteComplete ? "true" : "false") + ",";
   
-  // Add full tag table data
   json += "\"tags\":[";
   for (int i = 0; i < tagDatabaseCount; i++) {
     if (i > 0) json += ",";
@@ -163,7 +285,6 @@ void handleStatus() {
 
 void handleHistory() {
   String json = "{\"count\":" + String(historyCount) + ",\"readings\":[";
-  
   for (int i = 0; i < historyCount; i++) {
     if (i > 0) json += ",";
     json += "{";
@@ -173,20 +294,22 @@ void handleHistory() {
     json += "\"rssi\":" + String(readingHistory[i].rssi);
     json += "}";
   }
-  
   json += "]}";
   server.send(200, "application/json", json);
 }
 
 void handleStart() {
-  startMultiplePolling();
   isScanning = true;
+  startMultiplePolling();
   server.send(200, "text/plain", "OK");
 }
 
 void handleStop() {
-  stopMultiplePolling();
   isScanning = false;
+  stopMultiplePolling();
+  delay(100);
+  while (Serial2.available()) Serial2.read();
+  bufferIndex = 0;
   server.send(200, "text/plain", "OK");
 }
 
@@ -197,7 +320,7 @@ void handlePower() {
     setPower(power);
     server.send(200, "text/plain", "OK");
   } else {
-    server.send(400, "text/plain", "Missing power value");
+    server.send(400, "text/plain", "Missing power");
   }
 }
 
@@ -207,7 +330,7 @@ void handleClear() {
   historyCount = 0;
   systemStartTime = millis();
   lastTagEPC = "No tags detected yet";
-  Serial.println("Tag database and history cleared!");
+  Serial.println("Cleared!");
   server.send(200, "text/plain", "OK");
 }
 
@@ -217,11 +340,11 @@ void handleRegisterStart() {
   registrationConfirmCount = 0;
   
   if (!isScanning) {
-    startMultiplePolling();
     isScanning = true;
+    startMultiplePolling();
   }
   
-  Serial.println(">>> REGISTRATION MODE ACTIVATED <<<");
+  Serial.println(">>> REGISTRATION MODE <<<");
   server.send(200, "text/plain", "OK");
 }
 
@@ -229,13 +352,12 @@ void handleRegisterCancel() {
   registrationMode = false;
   registrationEPC = "";
   registrationConfirmCount = 0;
-  Serial.println("Registration cancelled");
   server.send(200, "text/plain", "OK");
 }
 
 void handleRegisterConfirm() {
   if (!server.hasArg("name") || !server.hasArg("epc")) {
-    server.send(400, "text/plain", "Missing name or EPC");
+    server.send(400, "text/plain", "Missing data");
     return;
   }
   
@@ -247,7 +369,6 @@ void handleRegisterConfirm() {
   for (int i = 0; i < tagDatabaseCount; i++) {
     if (tagDatabase[i].epc == epc) {
       tagDatabase[i].friendlyName = name;
-      Serial.println("Updated tag #" + String(i+1) + " with name: " + name);
       break;
     }
   }
@@ -256,7 +377,7 @@ void handleRegisterConfirm() {
   registrationEPC = "";
   registrationConfirmCount = 0;
   
-  Serial.println("✓ Tag registered: " + epc + " as '" + name + "'");
+  Serial.println("✓ Registered: " + name);
   server.send(200, "text/plain", "OK");
 }
 
@@ -274,14 +395,11 @@ void handleProgramStart() {
   verifyAttempts = 0;
   
   if (!isScanning) {
-    startMultiplePolling();
     isScanning = true;
+    startMultiplePolling();
   }
   
-  Serial.println(">>> PROGRAMMING MODE ACTIVATED <<<");
-  Serial.println("Target EPC: " + programmingEPC);
-  Serial.println("Waiting for blank tag (000000...)");
-  
+  Serial.println(">>> PROGRAMMING MODE <<<");
   server.send(200, "text/plain", "OK");
 }
 
@@ -291,31 +409,19 @@ void handleProgramCancel() {
   programmingConfirmCount = 0;
   programmingWriteComplete = false;
   verifyAttempts = 0;
-  Serial.println("Programming cancelled");
   server.send(200, "text/plain", "OK");
 }
 
 // ========================================
-// WiFi Setup
+// WiFi Setup - HARDCODED HERE
 // ========================================
-
 void setupWiFi() {
   Serial.println("\n--- WiFi Setup ---");
   Serial.print("Connecting to: ");
   Serial.println(WIFI_SSID);
   
-  // Static IP configuration - 192.168.34.134
-  IPAddress local_IP(192, 168, 34, 134);
-  IPAddress gateway(192, 168, 34, 1);
-  IPAddress subnet(255, 255, 255, 0);
-  IPAddress primaryDNS(8, 8, 8, 8);
-  
-  if (!WiFi.config(local_IP, gateway, subnet, primaryDNS)) {
-    Serial.println("⚠ Static IP configuration failed!");
-  } else {
-    Serial.println("✓ Static IP configured: 192.168.34.134");
-  }
-  
+  WiFi.mode(WIFI_STA);
+  // DON'T use static IP - let DHCP assign it!
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   
@@ -334,18 +440,56 @@ void setupWiFi() {
     Serial.print("Signal Strength: ");
     Serial.print(WiFi.RSSI());
     Serial.println(" dBm");
+    
+    // Setup mDNS - Access via http://esprfid.local
+    if (MDNS.begin("esprfid")) {
+      Serial.println("✓ mDNS started!");
+      Serial.println("Access at: http://esprfid.local");
+      MDNS.addService("http", "tcp", 80);
+    } else {
+      Serial.println("⚠ mDNS failed to start");
+    }
   } else {
     Serial.println("✗ WiFi Connection Failed!");
-    Serial.println("Please check SSID and password in config.h");
   }
+  // // Static IP configuration - 192.168.183.134 (WORK NETWORK)
+  // IPAddress local_IP(192, 168, 183, 134);
+  // IPAddress gateway(192, 168, 183, 1);
+  // IPAddress subnet(255, 255, 255, 0);
+  // IPAddress primaryDNS(8, 8, 8, 8);
+  
+  // if (!WiFi.config(local_IP, gateway, subnet, primaryDNS)) {
+  //   Serial.println("⚠ Static IP configuration failed!");
+  // } else {
+  //   Serial.println("✓ Static IP configured: 192.168.183.134");
+  // }
+  
+  // WiFi.mode(WIFI_STA);
+  // WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  
+  // int attempts = 0;
+  // while (WiFi.status() != WL_CONNECTED && attempts < 40) {
+  //   delay(500);
+  //   Serial.print(".");
+  //   attempts++;
+  // }
+  // Serial.println();
+  
+  // if (WiFi.status() == WL_CONNECTED) {
+  //   Serial.println("✓ WiFi Connected!");
+  //   Serial.print("IP Address: ");
+  //   Serial.println(WiFi.localIP());
+  //   Serial.print("Signal Strength: ");
+  //   Serial.print(WiFi.RSSI());
+  //   Serial.println(" dBm");
+  // } else {
+  //   Serial.println("✗ WiFi Connection Failed!");
+  //   Serial.println("Please check SSID and password in config.h");
+  // }
 }
 
-// ========================================
-// Web Server Setup
-// ========================================
-
 void setupWebServer() {
-  Serial.println("\n--- Web Server Setup ---");
+  Serial.println("\n--- Web Server ---");
   
   server.on("/", handleRoot);
   server.on("/api/status", handleStatus);
@@ -361,43 +505,26 @@ void setupWebServer() {
   server.on("/api/program/cancel", handleProgramCancel);
   
   server.begin();
-  Serial.println("✓ Web server started on port " + String(WEB_SERVER_PORT));
+  Serial.println("✓ Server started on port " + String(WEB_SERVER_PORT));
   Serial.println("Access at: http://" + WiFi.localIP().toString());
 }
 
-// ========================================
-// R200 Setup
-// ========================================
-
 void setupR200() {
-  Serial.println("\n--- R200 RFID Reader Setup ---");
+  Serial.println("\n--- R200 Setup ---");
   
   Serial2.begin(R200_BAUD, SERIAL_8N1, R200_RX_PIN, R200_TX_PIN);
-  
   delay(500);
-  while (Serial2.available()) {
-    Serial2.read();
-  }
+  while (Serial2.available()) Serial2.read();
   
-  Serial.println("Querying module info...");
   getHardwareVersion();
   delay(300);
   getSoftwareVersion();
   delay(300);
-  
-  Serial.println("Setting initial power...");
   setPower(currentPower);
   delay(300);
   
-  getPower();
-  delay(300);
-  
-  Serial.println("✓ R200 initialization complete");
+  Serial.println("✓ R200 ready");
 }
-
-// ========================================
-// Arduino Setup
-// ========================================
 
 void setup() {
   Serial.begin(115200);
@@ -424,303 +551,44 @@ void setup() {
   Serial.println("====================================\n");
 }
 
-// ========================================
-// Arduino Main Loop
-// ========================================
-
 void loop() {
   server.handleClient();
   
+  // Process incoming data
   while (Serial2.available()) {
     byte b = Serial2.read();
-    byteCount++;
-    
-    if (!registrationMode && !programmingMode) {
-      if (b < 0x10) Serial.print("0");
-      Serial.print(b, HEX);
-      Serial.print(" ");
-    }
     
     if (bufferIndex < BUFFER_SIZE) {
       rxBuffer[bufferIndex++] = b;
     } else {
-      Serial.println("\n[Buffer overflow - resetting]");
       bufferIndex = 0;
+      break;
     }
     
     if (b == 0xDD && bufferIndex > 2 && rxBuffer[0] == 0xAA) {
-      if (!registrationMode && !programmingMode) {
-        Serial.print("\n<-- Packet (len=");
-        Serial.print(bufferIndex);
-        Serial.println(")");
+      
+      // Silently skip error packets
+      if (bufferIndex == 8 && rxBuffer[1] == 0x01 && rxBuffer[2] == 0xFF) {
+        bufferIndex = 0;
+        continue;
       }
       
-      if (bufferIndex >= 24 && rxBuffer[1] == 0x02 && rxBuffer[2] == 0x22) {
-        
-        byte rssi_raw = rxBuffer[5];
-        int rssi_dbm = (int)rssi_raw - 256;
-        
-        String pc = "";
-        if (rxBuffer[6] < 0x10) pc += "0";
-        pc += String(rxBuffer[6], HEX);
-        if (rxBuffer[7] < 0x10) pc += "0";
-        pc += String(rxBuffer[7], HEX);
-        pc.toUpperCase();
-        
-        String epc = "";
-        for (int i = 8; i < 20; i++) {
-          if (rxBuffer[i] < 0x10) epc += "0";
-          epc += String(rxBuffer[i], HEX);
-        }
-        epc.toUpperCase();
-        
-        String crc = "";
-        if (rxBuffer[20] < 0x10) crc += "0";
-        crc += String(rxBuffer[20], HEX);
-        if (rxBuffer[21] < 0x10) crc += "0";
-        crc += String(rxBuffer[21], HEX);
-        crc.toUpperCase();
-        
-        // REGISTRATION MODE HANDLING
-        if (registrationMode) {
-          if (registrationEPC == "") {
-            registrationEPC = epc;
-            registrationConfirmCount = 1;
-            Serial.println("\n>>> Tag detected: " + epc);
-            Serial.println(">>> Hold steady... (1/5)");
-          } else if (registrationEPC == epc) {
-            registrationConfirmCount++;
-            Serial.println(">>> Confirmation: " + String(registrationConfirmCount) + "/5");
-            
-            if (registrationConfirmCount >= REGISTRATION_CONFIRM_THRESHOLD) {
-              Serial.println(">>> TAG READY FOR NAMING <<<");
-            }
-          } else {
-            registrationEPC = epc;
-            registrationConfirmCount = 1;
-            Serial.println("\n>>> Different tag detected: " + epc);
-            Serial.println(">>> Restarting... (1/5)");
-          }
-        }
-        
-        // PROGRAMMING MODE HANDLING
-        if (programmingMode) {
-          bool isBlank = true;
-          for (int i = 8; i < 20; i++) {
-            if (rxBuffer[i] != 0x00) {
-              isBlank = false;
-              break;
-            }
-          }
-          
-          if (isBlank && !programmingWriteComplete) {
-            programmingConfirmCount++;
-            Serial.println(">>> Blank tag detected! Confirmation: " + String(programmingConfirmCount) + "/3");
-            
-            if (programmingConfirmCount >= 3) {
-              Serial.println(">>> WRITING EPC NOW <<<");
-              
-              // Stop scanning
-              stopMultiplePolling();
-              delay(500);
-              
-              // Clear buffer
-              while (Serial2.available()) Serial2.read();
-              bufferIndex = 0;
-              
-              // Send write command
-              writeEPC(programmingEPC);
-              
-              // *** WAIT FOR RESPONSE ***
-              Serial.println(">>> Waiting for write response... <<<");
-              unsigned long startWait = millis();
-              bool gotResponse = false;
-              
-              while (millis() - startWait < 3000) {  // Wait 3 seconds max
-                while (Serial2.available()) {
-                  byte b = Serial2.read();
-                  
-                  // Print received bytes
-                  if (b < 0x10) Serial.print("0");
-                  Serial.print(b, HEX);
-                  Serial.print(" ");
-                  
-                  if (bufferIndex < BUFFER_SIZE) {
-                    rxBuffer[bufferIndex++] = b;
-                  }
-                  
-                  // Check for write response
-                  if (b == 0xDD && bufferIndex >= 8 && rxBuffer[0] == 0xAA && rxBuffer[2] == 0x49) {
-                    Serial.println("\n<-- Write Response Received");
-                    
-                    // Check status byte at position 5
-                    byte statusCode = rxBuffer[5];
-                    
-                    Serial.print("Status Code: 0x");
-                    if (statusCode < 0x10) Serial.print("0");
-                    Serial.println(statusCode, HEX);
-                    
-                    if (statusCode == 0x00) {
-                      Serial.println(">>> ✓✓✓ WRITE SUCCESSFUL! ✓✓✓ <<<");
-                      gotResponse = true;
-                      programmingWriteComplete = true;
-                    } else if (statusCode == 0x03) {
-                      Serial.println(">>> ✗ WRITE FAILED - Tag is LOCKED! ✗ <<<");
-                      Serial.println(">>> Tag requires unlock password <<<");
-                      gotResponse = true;
-                    } else if (statusCode == 0x04) {
-                      Serial.println(">>> ✗ WRITE FAILED - No tag in range! ✗ <<<");
-                      gotResponse = true;
-                    } else if (statusCode == 0x15) {
-                      Serial.println(">>> ✗ WRITE FAILED - Tag doesn't support writing! ✗ <<<");
-                      gotResponse = true;
-                    } else {
-                      Serial.print(">>> ✗ WRITE FAILED - Error code: 0x");
-                      if (statusCode < 0x10) Serial.print("0");
-                      Serial.println(statusCode, HEX);
-                      gotResponse = true;
-                    }
-                    
-                    bufferIndex = 0;
-                    break;
-                  }
-                }
-                
-                if (gotResponse) break;
-                delay(10);
-              }
-              
-              if (!gotResponse) {
-                Serial.println("\n>>> ⚠ NO RESPONSE from R200 - Write status unknown <<<");
-              }
-              
-              // Clear buffer
-              while (Serial2.available()) Serial2.read();
-              bufferIndex = 0;
-              
-              programmingConfirmCount = 0;
-              
-              if (programmingWriteComplete) {
-                // Resume scanning to verify
-                delay(500);
-                startMultiplePolling();
-                delay(300);
-                Serial.println(">>> Remove blank tag and scan programmed tag to verify <<<");
-              } else {
-                // Write failed - exit programming mode
-                Serial.println(">>> Programming failed - exiting mode <<<");
-                programmingMode = false;
-                programmingWriteComplete = false;
-                verifyAttempts = 0;
-                startMultiplePolling();
-              }
-            }
-          } else if (!isBlank && programmingWriteComplete) {
-            if (epc == programmingEPC) {
-              Serial.println(">>> ✓✓✓ SUCCESS! Tag verified with correct EPC! ✓✓✓ <<<");
-              Serial.println(">>> EPC: " + epc + " <<<");
-              programmingMode = false;
-              programmingWriteComplete = false;
-              programmingConfirmCount = 0;
-              verifyAttempts = 0;
-            } else {
-              verifyAttempts++;
-              if (verifyAttempts > 8) {
-                Serial.println(">>> ⚠ Tag shows different EPC <<<");
-                Serial.println(">>> Got: " + epc);
-                Serial.println(">>> Expected: " + programmingEPC);
-                programmingMode = false;
-                programmingWriteComplete = false;
-                programmingConfirmCount = 0;
-                verifyAttempts = 0;
-              }
-            }
-          }
-        }
-        // END OF PROGRAMMING MODE HANDLING
-        
-        // *** SLOW DOWN SCANNING - 2 reads per second ***
-        static unsigned long lastTagRead = 0;
-        if (millis() - lastTagRead < 500) {  // 500ms = 2 reads/second
-          bufferIndex = 0;
-          continue;  // Skip this read
-        }
-        lastTagRead = millis();
-        // *** END SLOW DOWN ***
-        
-        // NORMAL MODE - Update database
-        if (!registrationMode && !programmingMode) {
-          Serial.println("=== TAG DETECTED ===");
-          Serial.print("EPC: ");
-          Serial.println(epc);
-          Serial.print("RSSI: ");
-          Serial.print(rssi_dbm);
-          Serial.println(" dBm");
-        }
-        
-        int tagIndex = -1;
-        for (int i = 0; i < tagDatabaseCount; i++) {
-          if (tagDatabase[i].epc == epc) {
-            tagIndex = i;
-            break;
-          }
-        }
-        
-        if (tagIndex == -1) {
-          if (tagDatabaseCount < MAX_UNIQUE_TAGS) {
-            tagDatabase[tagDatabaseCount].epc = epc;
-            tagDatabase[tagDatabaseCount].pc = pc;
-            tagDatabase[tagDatabaseCount].crc = crc;
-            tagDatabase[tagDatabaseCount].rssi = rssi_dbm;
-            tagDatabase[tagDatabaseCount].readCount = 1;
-            tagDatabase[tagDatabaseCount].antenna = 1;
-            tagDatabase[tagDatabaseCount].lastSeen = millis();
-            tagDatabase[tagDatabaseCount].friendlyName = getTagName(epc);
-            tagDatabaseCount++;
-            
-            if (!registrationMode && !programmingMode) {
-              Serial.print(">>> NEW UNIQUE TAG #");
-              Serial.println(tagDatabaseCount);
-            }
-          }
-        } else {
-          tagDatabase[tagIndex].rssi = rssi_dbm;
-          tagDatabase[tagIndex].readCount++;
-          tagDatabase[tagIndex].lastSeen = millis();
-          
-          if (!registrationMode && !programmingMode) {
-            Serial.print("(Count: ");
-            Serial.print(tagDatabase[tagIndex].readCount);
-            Serial.println(")");
-          }
-        }
-        
-        if (historyCount < MAX_HISTORY) {
-          readingHistory[historyCount].timestamp = millis();
-          readingHistory[historyCount].epc = epc;
-          readingHistory[historyCount].bottleName = (tagIndex >= 0) ? tagDatabase[tagIndex].friendlyName : "";
-          readingHistory[historyCount].rssi = rssi_dbm;
-          readingHistory[historyCount].datetime = getTimestamp();
-          historyCount++;
-        }
-        
-        tagCount = tagDatabaseCount;
-        lastTagEPC = epc;
-        lastTagTime = millis();
-        
-        if (!registrationMode && !programmingMode) {
-          Serial.println("========================");
-        }
+      // Process tag packets (20 or 24 bytes)
+      if ((bufferIndex == 20 || bufferIndex >= 24) && rxBuffer[1] == 0x02 && rxBuffer[2] == 0x22) {
+        processTagPacket();
       }
       
       bufferIndex = 0;
     }
-    
-    if (!registrationMode && !programmingMode && byteCount % 20 == 0) {
-      Serial.println();
-    }
   }
   
+  // Emergency drain
+  if (Serial2.available() > 300) {
+    while (Serial2.available()) Serial2.read();
+    bufferIndex = 0;
+  }
+  
+  // WiFi watchdog
   static unsigned long lastWiFiCheck = 0;
   if (millis() - lastWiFiCheck > 10000) {
     if (WiFi.status() != WL_CONNECTED) {
